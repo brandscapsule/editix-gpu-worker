@@ -8,7 +8,7 @@ Opérations supportées :
 
 Contrat d'entrée :
 {
-  "operation": "health|normalize|derush",
+  "operation": "health|normalize|derush|effects",
   "inputUrl": "https://...",          // URL signée (lecture)
   "outputUrl": "https://...",         // URL signée (écriture PUT)
   "language": "fr",                   // optionnel
@@ -65,7 +65,7 @@ def download(url: str, dest: str) -> None:
 
 def upload(url: str, path: str) -> None:
     with open(path, "rb") as f:
-        req = urllib.request.Request(url, data=f.read(), method="PUT")
+        req = urllib.request.Request(url, data=f.read(), method="PUT", headers={"Content-Type": "video/mp4", "x-upsert": "true"})
         with urllib.request.urlopen(req, timeout=600) as r:
             if r.status >= 300:
                 raise RuntimeError(f"Upload result failed: {r.status}")
@@ -96,6 +96,13 @@ def op_health(_) -> dict:
     }
 
 
+def _venc() -> list[str]:
+    enc = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True).stdout
+    if "h264_nvenc" in enc:
+        return ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", "20"]
+    return ["-c:v", "libx264", "-preset", "medium", "-crf", "20"]
+
+
 def op_normalize(inp: dict, tmp: str) -> dict:
     src = os.path.join(tmp, "src")
     out = os.path.join(tmp, "out.mp4")
@@ -106,7 +113,7 @@ def op_normalize(inp: dict, tmp: str) -> dict:
             "-map", "0:v:0", "-map", "0:a?",
             "-vf", "scale='if(gt(iw,ih),min(1920,iw),-2)':'if(gt(iw,ih),-2,min(1920,ih))':force_original_aspect_ratio=decrease",
             "-r", "30", "-fps_mode", "cfr",
-            "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+            *_venc(),
             "-pix_fmt", "yuv420p", "-color_primaries", "bt709", "-color_trc", "bt709",
             "-colorspace", "bt709",
             "-c:a", "aac", "-b:a", "192k",
@@ -203,7 +210,209 @@ def op_derush(inp: dict, tmp: str) -> dict:
     }
 
 
-OPS = {"health": op_health, "normalize": op_normalize, "derush": op_derush}
+# ---------------------------------------------------------------------------
+# Effets GPU : détourage temporel (Robust Video Matting) + bokeh, et retouche visage
+# (MediaPipe Face Mesh lissé dans le temps : bouche, mâchoire, bronzage, dents).
+# ---------------------------------------------------------------------------
+
+_rvm = None
+_mesh = None
+
+
+def get_rvm():
+    global _rvm
+    if _rvm is None:
+        import torch
+
+        _rvm = torch.hub.load("PeterL1n/RobustVideoMatting", "resnet50", trust_repo=True).eval().cuda().half()
+    return _rvm
+
+
+def get_mesh():
+    global _mesh
+    if _mesh is None:
+        import mediapipe as mp
+
+        _mesh = mp.solutions.face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True,
+                                                min_detection_confidence=0.5, min_tracking_confidence=0.5)
+    return _mesh
+
+
+FACE_OVAL = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176,
+             149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109]
+INNER_LIPS = [78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95]
+EYES = [[33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246],
+        [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]]
+MOUTH_CENTER = [13, 14, 78, 308]
+JAW_L, JAW_R, CHIN = 172, 397, 152
+
+
+def _radial_warp(h, w, cx, cy, radius, scale, mapx, mapy):
+    """Grossit (scale>1) ou réduit (scale<1) une zone circulaire, bord progressif."""
+    import numpy as np
+
+    dx, dy = mapx - cx, mapy - cy
+    d = np.sqrt(dx * dx + dy * dy)
+    m = d < radius
+    t = np.clip(d / radius, 0, 1)
+    k = 1 - (1 - 1 / scale) * (1 - t * t) ** 2
+    mapx[m] = cx + dx[m] * k[m]
+    mapy[m] = cy + dy[m] * k[m]
+
+
+def _pinch_x(cx, cy, radius, amount, mapx, mapy, toward):
+    """Déplace les pixels d'une zone horizontalement vers `toward` (affinage de mâchoire)."""
+    import numpy as np
+
+    dx, dy = mapx - cx, mapy - cy
+    d = np.sqrt(dx * dx + dy * dy)
+    m = d < radius
+    f = (1 - np.clip(d / radius, 0, 1)) ** 2
+    mapx[m] = mapx[m] - (toward - cx) * amount * f[m]
+
+
+def _poly_mask(h, w, pts, feather):
+    import cv2
+    import numpy as np
+
+    mask = np.zeros((h, w), np.uint8)
+    cv2.fillPoly(mask, [pts.astype(np.int32)], 255)
+    if feather > 0:
+        k = int(feather) * 2 + 1
+        mask = cv2.GaussianBlur(mask, (k, k), 0)
+    return mask.astype(np.float32) / 255.0
+
+
+def face_retouch(frame, lm, s, base_x, base_y):
+    """lm : landmarks (N,2) en pixels, lissés. s : réglages -1..1."""
+    import cv2
+    import numpy as np
+
+    h, w = frame.shape[:2]
+    face_w = float(np.linalg.norm(lm[454] - lm[234]))
+    mapx, mapy = base_x.copy(), base_y.copy()
+    warped = False
+    mouth = s.get("mouth", 0)
+    if abs(mouth) > 0.01:
+        c = lm[MOUTH_CENTER].mean(0)
+        _radial_warp(h, w, c[0], c[1], face_w * 0.28, 1 + 0.18 * mouth, mapx, mapy)
+        warped = True
+    jaw = s.get("jaw", 0)
+    if abs(jaw) > 0.01:
+        cx = float(lm[CHIN][0])
+        for idx in (JAW_L, JAW_R, 136, 365):
+            _pinch_x(lm[idx][0], lm[idx][1], face_w * 0.22, 0.12 * jaw, mapx, mapy, cx)
+        warped = True
+    out = cv2.remap(frame, mapx, mapy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT) if warped else frame
+
+    tan = s.get("tan", 0)
+    if abs(tan) > 0.01:
+        skin = _poly_mask(h, w, lm[FACE_OVAL], face_w * 0.04)
+        for eye in EYES:
+            skin *= 1 - _poly_mask(h, w, lm[eye], face_w * 0.02)
+        skin *= 1 - _poly_mask(h, w, lm[INNER_LIPS], face_w * 0.01)
+        lab = cv2.cvtColor(out, cv2.COLOR_RGB2LAB).astype(np.float32)
+        lab[..., 0] -= 14 * tan * skin
+        lab[..., 1] += 5 * tan * skin
+        lab[..., 2] += 12 * tan * skin
+        out = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+
+    teeth = s.get("teeth", 0)
+    if teeth > 0.01:
+        inner = _poly_mask(h, w, lm[INNER_LIPS], face_w * 0.008)
+        if inner.max() > 0:
+            hsv = cv2.cvtColor(out, cv2.COLOR_RGB2HSV).astype(np.float32)
+            bright = np.clip((hsv[..., 2] - 90) / 80, 0, 1) * np.clip((140 - hsv[..., 1]) / 100, 0, 1)
+            m = inner * bright * teeth
+            lab = cv2.cvtColor(out, cv2.COLOR_RGB2LAB).astype(np.float32)
+            lab[..., 0] += 22 * m
+            lab[..., 2] -= (lab[..., 2] - 128) * 0.85 * m
+            lab[..., 1] -= (lab[..., 1] - 128) * 0.5 * m
+            out = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+    return out
+
+
+def op_effects(inp: dict, tmp: str) -> dict:
+    """Rend une version du rush avec bokeh/détourage et retouche visage, mêmes timecodes."""
+    import cv2
+    import numpy as np
+    import torch
+
+    s = inp.get("settings") or {}
+    bokeh = float(s.get("bokeh", 0))
+    cutout = s.get("background")  # None | "#rrggbb"
+    face_on = any(abs(float(s.get(k, 0))) > 0.01 for k in ("mouth", "jaw", "tan", "teeth"))
+    src = os.path.join(tmp, "src")
+    out = os.path.join(tmp, "out.mp4")
+    download(inp["inputUrl"], src)
+    info = probe(src)
+    v = next(x for x in info["streams"] if x.get("codec_type") == "video")
+    w, h = int(v["width"]), int(v["height"])
+    # ffprobe donne la taille avant rotation : on laisse ffmpeg redresser puis on relit la taille réelle.
+    rot = 0
+    for sd in v.get("side_data_list", []) or []:
+        rot = int(sd.get("rotation", 0) or 0)
+    if abs(rot) in (90, 270):
+        w, h = h, w
+    w, h = w - w % 2, h - h % 2
+    fps = "30"
+    reader = subprocess.Popen(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", src, "-vf", f"scale={w}:{h},fps=30",
+                               "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE)
+    encoder = "h264_nvenc" if "h264_nvenc" in subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True).stdout else "libx264"
+    venc = ["-c:v", encoder] + (["-preset", "p5", "-cq", "19"] if encoder == "h264_nvenc" else ["-preset", "medium", "-crf", "19"])
+    writer = subprocess.Popen(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
+                               "-s", f"{w}x{h}", "-r", fps, "-i", "-", "-i", src, "-map", "0:v", "-map", "1:a?",
+                               *venc, "-pix_fmt", "yuv420p", "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+                               "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", out], stdin=subprocess.PIPE)
+    model = get_rvm() if (bokeh > 0.01 or cutout) else None
+    mesh = get_mesh() if face_on else None
+    rec = [None] * 4
+    ratio = min(1.0, 512 / max(w, h)) if max(w, h) > 512 else 1.0
+    base_y, base_x = np.mgrid[0:h, 0:w].astype(np.float32)
+    smooth = None
+    bg_rgb = None
+    if cutout:
+        c = str(cutout).lstrip("#")
+        bg_rgb = np.array([int(c[i:i + 2], 16) for i in (0, 2, 4)], np.float32)
+    frame_bytes = w * h * 3
+    n = 0
+    while True:
+        buf = reader.stdout.read(frame_bytes)
+        if len(buf) < frame_bytes:
+            break
+        frame = np.frombuffer(buf, np.uint8).reshape(h, w, 3)
+        if mesh is not None:
+            r = mesh.process(frame)
+            if r.multi_face_landmarks:
+                lm = np.array([[p.x * w, p.y * h] for p in r.multi_face_landmarks[0].landmark], np.float32)
+                smooth = lm if smooth is None else smooth * 0.6 + lm * 0.4  # lissage temporel anti-tremblement
+            if smooth is not None:
+                frame = face_retouch(frame, smooth, s, base_x, base_y)
+        if model is not None:
+            with torch.no_grad():
+                t = torch.from_numpy(frame).cuda().permute(2, 0, 1).unsqueeze(0).half() / 255
+                _fgr, pha, *rec = model(t, *rec, downsample_ratio=ratio)
+                a = pha[0, 0].float().cpu().numpy()[..., None]
+            f32 = frame.astype(np.float32)
+            if bg_rgb is not None:
+                bg = np.broadcast_to(bg_rgb, f32.shape)
+            else:
+                k = int(8 + bokeh * 50) | 1
+                bg = cv2.GaussianBlur(f32, (k, k), 0)
+            frame = np.clip(f32 * a + bg * (1 - a), 0, 255).astype(np.uint8)
+        writer.stdin.write(frame.tobytes())
+        n += 1
+    writer.stdin.close()
+    writer.wait()
+    reader.wait()
+    if writer.returncode != 0:
+        raise RuntimeError("Encodage de la vidéo retouchée échoué")
+    if inp.get("outputUrl"):
+        upload(inp["outputUrl"], out)
+    return {"status": "completed", "frames": n, "width": w, "height": h, "duration": n / 30}
+
+
+OPS = {"health": op_health, "normalize": op_normalize, "derush": op_derush, "effects": op_effects}
 
 
 def handler(event: dict) -> dict:

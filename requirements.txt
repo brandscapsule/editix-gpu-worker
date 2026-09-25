@@ -1,4 +1,7 @@
 runpod==1.7.10
 faster-whisper==1.1.0
-numpy<2.2
+numpy<2
 torch==2.5.1
+torchvision==0.20.1
+opencv-python-headless==4.10.0.84
+mediapipe==0.10.14
