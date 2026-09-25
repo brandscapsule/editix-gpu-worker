@@ -96,11 +96,33 @@ def op_health(_) -> dict:
     }
 
 
-def _venc() -> list[str]:
-    enc = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True).stdout
-    if "h264_nvenc" in enc:
-        return ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", "20"]
-    return ["-c:v", "libx264", "-preset", "medium", "-crf", "20"]
+_NVENC: bool | None = None
+
+
+def nvenc_ok() -> bool:
+    """Teste réellement NVENC : listé dans ffmpeg ne veut pas dire utilisable dans le conteneur."""
+    global _NVENC
+    if _NVENC is None:
+        enc = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True).stdout
+        if "h264_nvenc" not in enc:
+            _NVENC = False
+        else:
+            t = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=320x240:r=30:d=0.1",
+                 "-c:v", "h264_nvenc", "-f", "null", "-"],
+                capture_output=True, text=True,
+            )
+            _NVENC = t.returncode == 0
+            if not _NVENC:
+                print(f"[venc] NVENC indisponible, repli libx264 : {t.stderr.strip()[:300]}", flush=True)
+    return _NVENC
+
+
+def _venc(crf: int = 20) -> list[str]:
+    if nvenc_ok():
+        return ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", str(crf)]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf)]
+
 
 
 def op_normalize(inp: dict, tmp: str) -> dict:
@@ -358,12 +380,12 @@ def op_effects(inp: dict, tmp: str) -> dict:
     fps = "30"
     reader = subprocess.Popen(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", src, "-vf", f"scale={w}:{h},fps=30",
                                "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE)
-    encoder = "h264_nvenc" if "h264_nvenc" in subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True).stdout else "libx264"
-    venc = ["-c:v", encoder] + (["-preset", "p5", "-cq", "19"] if encoder == "h264_nvenc" else ["-preset", "medium", "-crf", "19"])
+    venc = _venc(19)
     writer = subprocess.Popen(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
                                "-s", f"{w}x{h}", "-r", fps, "-i", "-", "-i", src, "-map", "0:v", "-map", "1:a?",
                                *venc, "-pix_fmt", "yuv420p", "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
-                               "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", out], stdin=subprocess.PIPE)
+                               "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", out],
+                              stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     model = get_rvm() if (bokeh > 0.01 or cutout) else None
     mesh = get_mesh() if face_on else None
     rec = [None] * 4
@@ -400,13 +422,20 @@ def op_effects(inp: dict, tmp: str) -> dict:
                 k = int(8 + bokeh * 50) | 1
                 bg = cv2.GaussianBlur(f32, (k, k), 0)
             frame = np.clip(f32 * a + bg * (1 - a), 0, 255).astype(np.uint8)
-        writer.stdin.write(frame.tobytes())
+        try:
+            writer.stdin.write(frame.tobytes())
+        except BrokenPipeError:
+            # L'encodeur s'est arrêté : on récupère son message réel au lieu d'un « Broken pipe » opaque.
+            err = (writer.stderr.read().decode("utf-8", "ignore") if writer.stderr else "").strip()
+            reader.kill()
+            raise RuntimeError(f"Encodage interrompu par ffmpeg : {err[:400] or 'raison inconnue'}") from None
         n += 1
     writer.stdin.close()
     writer.wait()
     reader.wait()
     if writer.returncode != 0:
-        raise RuntimeError("Encodage de la vidéo retouchée échoué")
+        err = (writer.stderr.read().decode("utf-8", "ignore") if writer.stderr else "").strip()
+        raise RuntimeError(f"Encodage de la vidéo retouchée échoué : {err[:400]}")
     if inp.get("outputUrl"):
         upload(inp["outputUrl"], out)
     return {"status": "completed", "frames": n, "width": w, "height": h, "duration": n / 30}

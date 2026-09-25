@@ -1,5 +1,9 @@
 FROM python:3.11-slim
 
+# Autorise l'accès au moteur d'encodage vidéo de la carte graphique dans le conteneur
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg git libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
